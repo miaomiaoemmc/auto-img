@@ -408,6 +408,15 @@ def run_detection_and_crop(tasks: list[ImageTask], args: argparse.Namespace, sta
     return stats
 
 
+def load_image(path: Path) -> Image.Image:
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise SystemExit("[ERROR] missing Pillow. Run: pip install -r requirements.txt") from exc
+    with Image.open(path) as opened:
+        return ImageOps.exif_transpose(opened).copy()
+
+
 def print_summary(stats: Stats) -> None:
     print("\nSummary")
     print(f"  scanned:          {stats.scanned}")

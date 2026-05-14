@@ -1,15 +1,24 @@
 {
   "name": "auto-img-gui",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "api": "uvicorn api_server:app --host 127.0.0.1 --port 8000 --reload",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "jszip": "^3.10.1",
     "next": "15.3.2",
     "react": "19.1.0",
     "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.4.5"
   }
 }

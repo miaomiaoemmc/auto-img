@@ -1,10 +1,105 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { saveState, loadState, clearState } from "lib/storage";
+import { exportResultsToZip, triggerDownload } from "lib/export";
+
+/* ── Types ── */
+
+type QueueStatus =
+  | "queued"
+  | "detecting"
+  | "ready"
+  | "processing"
+  | "processed"
+  | "no_face"
+  | "skipped"
+  | "error";
+
+type Tool = "keep" | "erase";
+type Mode = "single" | "batch";
+
+interface FaceBox {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+interface FaceInfo {
+  index: number;
+  confidence: number;
+  box: FaceBox;
+  previewDataUrl: string;
+}
+
+interface DetectionImage {
+  width: number;
+  height: number;
+  name: string;
+}
+
+interface DetectionResult {
+  imageId: string;
+  image: DetectionImage;
+  faces: FaceInfo[];
+}
+
+interface CropResult {
+  dataUrl: string;
+  complete: boolean;
+  padded: boolean;
+  resized: boolean;
+  size: { width: number; height: number };
+}
+
+interface PaintedResult {
+  dataUrl: string;
+  size: { width: number; height: number };
+}
+
+interface ProcessResult {
+  crop?: CropResult;
+  painted?: PaintedResult;
+}
+
+interface QueueItem {
+  localId: string;
+  file: File;
+  previewUrl: string;
+  name: string;
+  pathLabel: string;
+  status: QueueStatus;
+  detection: DetectionResult | null;
+  keepFaceId: number | null;
+  eraseFaceIds: number[];
+  result: ProcessResult | null;
+  error: string;
+}
+
+interface StatusMeta {
+  label: string;
+  tone: string;
+}
+
+interface ToolMeta {
+  label: string;
+  hint: string;
+}
+
+interface Summary {
+  total: number;
+  processed: number;
+  waiting: number;
+  blocked: number;
+  skipped: number;
+}
+
+/* ── Constants ── */
 
 const IMAGE_FILE_PATTERN = /\.(jpg|jpeg|png|webp)$/i;
 
-const STATUS_META = {
+const STATUS_META: Record<QueueStatus, StatusMeta> = {
   queued: { label: "待检测", tone: "neutral" },
   detecting: { label: "检测中", tone: "info" },
   ready: { label: "待确认", tone: "accent" },
@@ -12,25 +107,21 @@ const STATUS_META = {
   processed: { label: "已完成", tone: "success" },
   no_face: { label: "无人脸", tone: "muted" },
   skipped: { label: "已跳过", tone: "muted" },
-  error: { label: "出错", tone: "danger" }
+  error: { label: "出错", tone: "danger" },
 };
 
-const TOOL_META = {
-  keep: {
-    label: "保留工具",
-    hint: "点选要保留的人脸"
-  },
-  erase: {
-    label: "涂抹工具",
-    hint: "点选要抹掉的人脸，可多选"
-  }
+const TOOL_META: Record<Tool, ToolMeta> = {
+  keep: { label: "保留工具", hint: "点选要保留的人脸" },
+  erase: { label: "涂抹工具", hint: "点选要抹掉的人脸，可多选" },
 };
 
-function isImageFile(file) {
+/* ── Helpers ── */
+
+function isImageFile(file: File): boolean {
   return file.type.startsWith("image/") || IMAGE_FILE_PATTERN.test(file.name);
 }
 
-function sortFiles(files) {
+function sortFiles(files: File[]): File[] {
   return [...files].sort((left, right) => {
     const leftLabel = left.webkitRelativePath || left.name;
     const rightLabel = right.webkitRelativePath || right.name;
@@ -38,7 +129,7 @@ function sortFiles(files) {
   });
 }
 
-function createQueueItems(files) {
+function createQueueItems(files: File[]): QueueItem[] {
   const timestamp = Date.now();
   return sortFiles(files)
     .filter(isImageFile)
@@ -48,16 +139,16 @@ function createQueueItems(files) {
       previewUrl: URL.createObjectURL(file),
       name: file.name,
       pathLabel: file.webkitRelativePath || file.name,
-      status: "queued",
+      status: "queued" as QueueStatus,
       detection: null,
       keepFaceId: null,
       eraseFaceIds: [],
       result: null,
-      error: ""
+      error: "",
     }));
 }
 
-function revokeQueueUrls(queue) {
+function revokeQueueUrls(queue: QueueItem[]): void {
   for (const item of queue) {
     if (item.previewUrl) {
       URL.revokeObjectURL(item.previewUrl);
@@ -65,16 +156,16 @@ function revokeQueueUrls(queue) {
   }
 }
 
-function formatConfidence(value) {
+function formatConfidence(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function basename(filename) {
+function basename(filename: string): string {
   const lastDot = filename.lastIndexOf(".");
   return lastDot > 0 ? filename.slice(0, lastDot) : filename;
 }
 
-function isSelectionMissing(item, tool) {
+function isSelectionMissing(item: QueueItem, tool: Tool): boolean {
   if (!item?.detection?.faces?.length) {
     return false;
   }
@@ -84,34 +175,35 @@ function isSelectionMissing(item, tool) {
   return item.eraseFaceIds.length === 0;
 }
 
-function queueSummary(queue, tool) {
+function queueSummary(queue: QueueItem[], tool: Tool): Summary {
   const total = queue.length;
   const processed = queue.filter((item) => item.status === "processed").length;
   const waiting = queue.filter((item) => item.status === "queued" || item.status === "ready").length;
-  const blocked = queue.filter((item) => item.status === "ready" && isSelectionMissing(item, tool)).length;
-  const skipped = queue.filter((item) => item.status === "no_face" || item.status === "skipped").length;
+  const blocked = queue.filter(
+    (item) => item.status === "ready" && isSelectionMissing(item, tool)
+  ).length;
+  const skipped = queue.filter(
+    (item) => item.status === "no_face" || item.status === "skipped"
+  ).length;
   return { total, processed, waiting, blocked, skipped };
 }
 
-function nextReviewableId(queue, currentId) {
+function nextReviewableId(queue: QueueItem[], currentId: string | null): string | null {
   if (!queue.length) {
     return null;
   }
 
-  const currentIndex = Math.max(
-    0,
-    queue.findIndex((item) => item.localId === currentId)
-  );
+  const currentIndex = Math.max(0, queue.findIndex((item) => item.localId === currentId));
   const ordered = [...queue.slice(currentIndex + 1), ...queue.slice(0, currentIndex)];
   const next = ordered.find((item) => ["queued", "ready", "error"].includes(item.status));
   return next?.localId ?? null;
 }
 
-function modeLabel(mode) {
+function modeLabel(mode: Mode): string {
   return mode === "batch" ? "批量队列" : "单张工作区";
 }
 
-function promptForItem(item, tool) {
+function promptForItem(item: QueueItem | null, tool: Tool): string {
   if (!item) {
     return "先选择一张图片或一个文件夹。";
   }
@@ -145,30 +237,45 @@ function promptForItem(item, tool) {
   return `已选择 ${item.eraseFaceIds.length} 张待抹除的人脸。`;
 }
 
-function downloadName(item, suffix) {
+function downloadName(item: QueueItem, suffix: string): string {
   return `${basename(item.name)}-${suffix}.jpg`;
 }
 
-export default function FaceWorkbench() {
-  const [mode, setMode] = useState("single");
-  const [tool, setTool] = useState("keep");
-  const [queue, setQueue] = useState([]);
-  const [activeItemId, setActiveItemId] = useState(null);
-  const [globalError, setGlobalError] = useState("");
-  const [faceRatio, setFaceRatio] = useState(0.45);
+/* ── Component ── */
 
-  const queueRef = useRef([]);
-  const singleInputRef = useRef(null);
-  const folderInputRef = useRef(null);
+export default function FaceWorkbench(): JSX.Element {
+  const [mode, setMode] = useState<Mode>("single");
+  const [tool, setTool] = useState<Tool>("keep");
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [activeItemId, setActiveItemId] = useState<string | null>(null);
+  const [globalError, setGlobalError] = useState<string>("");
+  const [faceRatio, setFaceRatio] = useState<number>(0.45);
+  const [isDragging, setIsDragging] = useState(false);
+  const [showKeyboardHint, setShowKeyboardHint] = useState(false);
+  const [pendingRestore, setPendingRestore] = useState<{
+    mode: Mode;
+    tool: Tool;
+    faceRatio: number;
+    items: QueueItem[];
+    activeItemId: string | null;
+  } | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+
+  const queueRef = useRef<QueueItem[]>([]);
+  const singleInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const dragCounterRef = useRef(0);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     queueRef.current = queue;
   }, [queue]);
 
   useEffect(() => {
-    if (folderInputRef.current) {
-      folderInputRef.current.setAttribute("webkitdirectory", "");
-      folderInputRef.current.setAttribute("directory", "");
+    const el = folderInputRef.current;
+    if (el) {
+      el.setAttribute("webkitdirectory", "");
+      el.setAttribute("directory", "");
     }
   }, []);
 
@@ -177,6 +284,168 @@ export default function FaceWorkbench() {
       revokeQueueUrls(queueRef.current);
     };
   }, []);
+
+  /* ── Persist state ── */
+  useEffect(() => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+    }
+    saveTimerRef.current = setTimeout(() => {
+      if (!queue.length) {
+        void clearState();
+        return;
+      }
+      void saveState({
+        mode,
+        tool,
+        faceRatio,
+        items: queue.map((item) => ({
+          localId: item.localId,
+          name: item.name,
+          pathLabel: item.pathLabel,
+          status: item.status,
+          detection: item.detection,
+          keepFaceId: item.keepFaceId,
+          eraseFaceIds: item.eraseFaceIds,
+          result: item.result,
+          error: item.error,
+        })),
+        activeItemId,
+        timestamp: Date.now(),
+      });
+    }, 800);
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, [queue, mode, tool, faceRatio, activeItemId]);
+
+  /* ── Restore state on mount ── */
+  useEffect(() => {
+    void (async () => {
+      const saved = await loadState();
+      if (!saved || !saved.items?.length) return;
+      const ageHours = (Date.now() - (saved.timestamp || 0)) / 3600000;
+      if (ageHours > 24) {
+        void clearState();
+        return;
+      }
+      setPendingRestore({
+        mode: saved.mode as Mode,
+        tool: saved.tool as Tool,
+        faceRatio: saved.faceRatio,
+        items: saved.items.map((it) => ({
+          localId: it.localId,
+          file: new File([], it.name),
+          previewUrl: "",
+          name: it.name,
+          pathLabel: it.pathLabel,
+          status: it.status as QueueStatus,
+          detection: it.detection as DetectionResult | null,
+          keepFaceId: it.keepFaceId,
+          eraseFaceIds: it.eraseFaceIds,
+          result: it.result as ProcessResult | null,
+          error: it.error,
+        })),
+        activeItemId: saved.activeItemId,
+      });
+    })();
+  }, []);
+
+  function applyRestore(files: FileList | null, nextMode: Mode) {
+    if (!pendingRestore || !files?.length) {
+      installQueue(files, nextMode);
+      return;
+    }
+    const fileArray = Array.from(files).filter(isImageFile);
+    const restoredItems: QueueItem[] = fileArray.map((file) => {
+      const matched = pendingRestore.items.find((it) => it.name === file.name);
+      if (matched) {
+        return {
+          ...matched,
+          file,
+          previewUrl: URL.createObjectURL(file),
+          pathLabel: file.webkitRelativePath || file.name,
+        };
+      }
+      return {
+        localId: `${Date.now()}-${file.name}`,
+        file,
+        previewUrl: URL.createObjectURL(file),
+        name: file.name,
+        pathLabel: file.webkitRelativePath || file.name,
+        status: "queued" as QueueStatus,
+        detection: null,
+        keepFaceId: null,
+        eraseFaceIds: [],
+        result: null,
+        error: "",
+      };
+    });
+
+    revokeQueueUrls(queueRef.current);
+    setMode(pendingRestore.mode);
+    setTool(pendingRestore.tool);
+    setFaceRatio(pendingRestore.faceRatio);
+    setQueue(restoredItems);
+    setActiveItemId(pendingRestore.activeItemId ?? restoredItems[0]?.localId ?? null);
+    setPendingRestore(null);
+    setGlobalError(restoredItems.length ? "" : "所选内容里没有可处理的图片。");
+  }
+
+  /* ── Keyboard hint visibility ── */
+  useEffect(() => {
+    const timer = setTimeout(() => setShowKeyboardHint(true), 2000);
+    const hideTimer = setTimeout(() => setShowKeyboardHint(false), 12000);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(hideTimer);
+    };
+  }, []);
+
+  /* ── Drag & Drop ── */
+  function handleDragEnter(event: React.DragEvent) {
+    event.preventDefault();
+    dragCounterRef.current += 1;
+    if (event.dataTransfer.types.includes("Files")) {
+      setIsDragging(true);
+    }
+  }
+
+  function handleDragOver(event: React.DragEvent) {
+    event.preventDefault();
+    if (event.dataTransfer.types.includes("Files")) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }
+
+  function handleDragLeave(event: React.DragEvent) {
+    event.preventDefault();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current === 0) {
+      setIsDragging(false);
+    }
+  }
+
+  function handleDrop(event: React.DragEvent) {
+    event.preventDefault();
+    dragCounterRef.current = 0;
+    setIsDragging(false);
+
+    const files = event.dataTransfer.files;
+    if (files.length) {
+      const hasFolders = Array.from(files).some((f) => f.webkitRelativePath && f.webkitRelativePath.includes("/"));
+      applyRestore(files, hasFolders ? "batch" : "single");
+    }
+  }
+
+  function goPreviousItem() {
+    if (!activeItem || !queue.length) return;
+    const currentIndex = queue.findIndex((item) => item.localId === activeItem.localId);
+    const prevIndex = currentIndex > 0 ? currentIndex - 1 : queue.length - 1;
+    setActiveItemId(queue[prevIndex].localId);
+  }
 
   const activeItem = queue.find((item) => item.localId === activeItemId) ?? null;
   const summary = queueSummary(queue, tool);
@@ -193,8 +462,9 @@ export default function FaceWorkbench() {
     }
   }, [activeItem]);
 
-  function installQueue(nextFiles, nextMode) {
-    const nextItems = createQueueItems(Array.from(nextFiles || []));
+  function installQueue(nextFiles: FileList | null, nextMode: Mode) {
+    const filesArray = nextFiles ? Array.from(nextFiles) : [];
+    const nextItems = createQueueItems(filesArray);
     revokeQueueUrls(queueRef.current);
     setQueue(nextItems);
     setMode(nextMode);
@@ -202,7 +472,7 @@ export default function FaceWorkbench() {
     setGlobalError(nextItems.length ? "" : "所选内容里没有可处理的图片。");
   }
 
-  function updateQueueItem(localId, transform) {
+  function updateQueueItem(localId: string, transform: Partial<QueueItem> | ((item: QueueItem) => QueueItem)) {
     setQueue((current) =>
       current.map((item) => {
         if (item.localId !== localId) {
@@ -213,12 +483,12 @@ export default function FaceWorkbench() {
     );
   }
 
-  function getFacesByIndexes(faces, indexes) {
+  function getFacesByIndexes(faces: FaceInfo[], indexes: number[]): FaceInfo[] {
     const indexSet = new Set(indexes);
     return faces.filter((face) => indexSet.has(face.index));
   }
 
-  async function detectItem(localId, force = false) {
+  async function detectItem(localId: string, force = false) {
     const item = queueRef.current.find((entry) => entry.localId === localId);
     if (!item) {
       return;
@@ -229,7 +499,7 @@ export default function FaceWorkbench() {
 
     updateQueueItem(localId, {
       status: "detecting",
-      error: ""
+      error: "",
     });
 
     try {
@@ -238,7 +508,7 @@ export default function FaceWorkbench() {
 
       const response = await fetch("/api/detect", {
         method: "POST",
-        body: formData
+        body: formData,
       });
       const payload = await response.json();
 
@@ -247,10 +517,12 @@ export default function FaceWorkbench() {
       }
 
       updateQueueItem(localId, (current) => {
-        const faces = payload.faces || [];
-        const validKeep = faces.some((face) => face.index === current.keepFaceId) ? current.keepFaceId : null;
+        const faces: FaceInfo[] = payload.faces || [];
+        const validKeep = faces.some((face: FaceInfo) => face.index === current.keepFaceId)
+          ? current.keepFaceId
+          : null;
         const validEraseFaceIds = current.eraseFaceIds.filter((faceId) =>
-          faces.some((face) => face.index === faceId)
+          faces.some((face: FaceInfo) => face.index === faceId)
         );
 
         return {
@@ -262,25 +534,37 @@ export default function FaceWorkbench() {
             image: {
               width: payload.image.width,
               height: payload.image.height,
-              name: payload.image.name
+              name: payload.image.name,
             },
-            faces
+            faces,
           },
           keepFaceId: faces.length === 1 ? faces[0].index : validKeep,
-          eraseFaceIds: validEraseFaceIds
+          eraseFaceIds: validEraseFaceIds,
         };
       });
       setGlobalError("");
+
+      // Auto-process single face in keep mode
+      const facesAfter = queueRef.current.find((entry) => entry.localId === localId)?.detection?.faces;
+      if (facesAfter && facesAfter.length === 1 && tool === "keep") {
+        await saveCurrentItem(localId);
+        if (mode === "batch") {
+          const nextId = nextReviewableId(queueRef.current, localId);
+          if (nextId && nextId !== localId) {
+            setActiveItemId(nextId);
+          }
+        }
+      }
     } catch (error) {
       updateQueueItem(localId, {
         status: "error",
-        error: error instanceof Error ? error.message : "检测失败。"
+        error: error instanceof Error ? error.message : "检测失败。",
       });
       setGlobalError(error instanceof Error ? error.message : "检测失败。");
     }
   }
 
-  async function saveCurrentItem(localId) {
+  async function saveCurrentItem(localId: string) {
     let item = queueRef.current.find((entry) => entry.localId === localId);
     if (!item) {
       return;
@@ -298,9 +582,10 @@ export default function FaceWorkbench() {
 
     const keepFace =
       tool === "keep" && item.keepFaceId != null
-        ? item.detection.faces.find((face) => face.index === item.keepFaceId)
+        ? item.detection.faces.find((face) => face.index === item!.keepFaceId)
         : null;
-    const eraseFaces = tool === "erase" ? getFacesByIndexes(item.detection.faces, item.eraseFaceIds) : [];
+    const eraseFaces =
+      tool === "erase" ? getFacesByIndexes(item.detection.faces, item.eraseFaceIds) : [];
 
     if (!keepFace && eraseFaces.length === 0) {
       setGlobalError("先用工具选人脸：保留一张，或者抹掉一张。");
@@ -313,14 +598,14 @@ export default function FaceWorkbench() {
       const response = await fetch("/api/process", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           imageId: item.detection.imageId,
           faceRatio,
           keepBox: keepFace?.box ?? null,
-          eraseBoxes: eraseFaces.map((face) => face.box)
-        })
+          eraseBoxes: eraseFaces.map((face) => face.box),
+        }),
       });
 
       const payload = await response.json();
@@ -333,16 +618,16 @@ export default function FaceWorkbench() {
         status: "processed",
         result: {
           ...(current.result ?? {}),
-          ...payload
+          ...payload,
         },
-        error: ""
+        error: "",
       }));
       setGlobalError("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "处理失败。";
       updateQueueItem(localId, {
         status: "error",
-        error: message
+        error: message,
       });
       setGlobalError(message);
     }
@@ -371,9 +656,37 @@ export default function FaceWorkbench() {
     setQueue([]);
     setActiveItemId(null);
     setGlobalError("");
+    void clearState();
   }
 
-  function selectFace(faceIndex) {
+  async function handleExportAll() {
+    const results = queue
+      .filter((item) => item.result && (item.result.crop || item.result.painted))
+      .map((item) => ({
+        name: item.name,
+        crop: item.result?.crop,
+        painted: item.result?.painted,
+      }));
+
+    if (results.length === 0) {
+      setGlobalError("没有可导出的结果，请先处理图片。");
+      return;
+    }
+
+    setIsExporting(true);
+    setGlobalError("");
+    try {
+      const blob = await exportResultsToZip(results);
+      const timestamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      triggerDownload(blob, `PortraitStudio_Export_${timestamp}.zip`);
+    } catch (error) {
+      setGlobalError(error instanceof Error ? error.message : "导出失败。");
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  function selectFace(faceIndex: number) {
     if (!activeItem) {
       return;
     }
@@ -387,7 +700,7 @@ export default function FaceWorkbench() {
           ...current,
           eraseFaceIds: exists
             ? current.eraseFaceIds.filter((id) => id !== faceIndex)
-            : [...current.eraseFaceIds, faceIndex]
+            : [...current.eraseFaceIds, faceIndex],
         };
       });
     }
@@ -403,14 +716,74 @@ export default function FaceWorkbench() {
     !activeItem.detection?.faces?.length ||
     isSelectionMissing(activeItem, tool);
 
+  /* ── Keyboard shortcuts ── */
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      switch (event.key) {
+        case "ArrowRight":
+          event.preventDefault();
+          goNextItem();
+          break;
+        case "ArrowLeft":
+          event.preventDefault();
+          goPreviousItem();
+          break;
+        case "s":
+        case "S":
+          if (activeItem && !saveDisabled) {
+            event.preventDefault();
+            void saveCurrentItem(activeItem.localId);
+          }
+          break;
+        case "x":
+        case "X":
+          if (activeItem && !["processed", "skipped"].includes(activeItem.status)) {
+            event.preventDefault();
+            skipActiveItem();
+          }
+          break;
+        case "1":
+        case "2":
+        case "3":
+        case "4":
+        case "5":
+        case "6":
+        case "7":
+        case "8":
+        case "9": {
+          const index = parseInt(event.key, 10) - 1;
+          const faces = activeItem?.detection?.faces;
+          if (faces && faces[index]) {
+            event.preventDefault();
+            selectFace(faces[index].index);
+          }
+          break;
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeItem, saveDisabled, tool]);
+
   return (
-    <main className="mailApp">
+    <main
+      className="mailApp"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <header className="topbar">
         <div className="brandBlock">
-          <div className="brandGlyph">F</div>
+          <div className="brandGlyph">P</div>
           <div>
-            <p className="brandEyebrow">Face Mailroom</p>
-            <h1>像收件箱一样处理人脸图片</h1>
+            <p className="brandEyebrow">Portrait Studio</p>
+            <h1>智能人像构图助手</h1>
           </div>
         </div>
 
@@ -463,6 +836,14 @@ export default function FaceWorkbench() {
             <button className="actionButton subtle" onClick={clearWorkspace} type="button">
               清空当前队列
             </button>
+            <button
+              className="actionButton"
+              disabled={isExporting || !queue.some((item) => item.result)}
+              onClick={handleExportAll}
+              type="button"
+            >
+              {isExporting ? "打包中..." : "全部导出 ZIP"}
+            </button>
 
             <div className="toolPalette">
               <div className="toolPaletteHeader">
@@ -493,10 +874,10 @@ export default function FaceWorkbench() {
               </label>
               <input
                 id="face-ratio"
-                max="0.7"
-                min="0.3"
+                max={0.7}
+                min={0.3}
                 onChange={(event) => setFaceRatio(Number(event.target.value))}
-                step="0.01"
+                step={0.01}
                 type="range"
                 value={faceRatio}
               />
@@ -593,7 +974,7 @@ export default function FaceWorkbench() {
                         left: `${boxLeft}%`,
                         top: `${boxTop}%`,
                         width: `${boxWidth}%`,
-                        height: `${boxHeight}%`
+                        height: `${boxHeight}%`,
                       }}
                       type="button"
                     >
@@ -604,7 +985,11 @@ export default function FaceWorkbench() {
               </div>
 
               <div className="stageToolbar">
-                <button className="actionButton subtle" onClick={() => detectItem(activeItem.localId, true)} type="button">
+                <button
+                  className="actionButton subtle"
+                  onClick={() => detectItem(activeItem.localId, true)}
+                  type="button"
+                >
                   重新检测
                 </button>
                 <button
@@ -670,7 +1055,9 @@ export default function FaceWorkbench() {
                     >
                       <img alt={`Face ${order + 1}`} src={face.previewDataUrl} />
                       <div>
-                        <strong>{keepSelected ? "保留目标" : eraseSelected ? "抹除目标" : `候选 ${order + 1}`}</strong>
+                        <strong>
+                          {keepSelected ? "保留目标" : eraseSelected ? "抹除目标" : `候选 ${order + 1}`}
+                        </strong>
                         <span>置信度 {formatConfidence(face.confidence)}</span>
                       </div>
                     </button>
@@ -747,11 +1134,47 @@ export default function FaceWorkbench() {
         </aside>
       </section>
 
+      {pendingRestore ? (
+        <div className="restoreToast">
+          <div className="restoreToastContent">
+            <strong>检测到之前的工作状态</strong>
+            <span>{pendingRestore.items.length} 张图片 · {pendingRestore.items.filter((i) => i.status === "processed").length} 个结果</span>
+            <div className="restoreActions">
+              <button
+                className="actionButton primary"
+                onClick={() => singleInputRef.current?.click()}
+                type="button"
+              >
+                重新导入图片恢复
+              </button>
+              <button
+                className="actionButton subtle"
+                onClick={() => {
+                  setPendingRestore(null);
+                  void clearState();
+                }}
+                type="button"
+              >
+                丢弃
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className={`dragOverlay ${isDragging ? "active" : ""}`}>
+        <div className="dragOverlayText">拖放图片到此处</div>
+      </div>
+
+      <div className={`keyboardHint ${showKeyboardHint ? "visible" : ""}`}>
+        ← → 切换图片 · 1-9 选择人脸 · S 保存 · X 跳过
+      </div>
+
       <input
         accept="image/*"
         hidden
         onChange={(event) => {
-          installQueue(event.target.files, "single");
+          applyRestore(event.target.files, "single");
           event.target.value = "";
         }}
         ref={singleInputRef}
@@ -762,7 +1185,7 @@ export default function FaceWorkbench() {
         hidden
         multiple
         onChange={(event) => {
-          installQueue(event.target.files, "batch");
+          applyRestore(event.target.files, "batch");
           event.target.value = "";
         }}
         ref={folderInputRef}
