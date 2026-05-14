@@ -166,7 +166,8 @@ async def detect(
         )
 
     temp_root = _ensure_temp_dir()
-    upload_id = f"{uuid.uuid4().hex[:12]}-{file.filename or 'upload'}"
+    safe_name = Path(file.filename or "upload").name
+    upload_id = f"{uuid.uuid4().hex[:12]}-{safe_name}"
     upload_path = temp_root / upload_id
 
     try:
@@ -282,8 +283,6 @@ async def process(body: ProcessRequest) -> dict[str, Any]:
                 "size": {"width": painted.size[0], "height": painted.size[1]},
             }
 
-        # Clean up after successful processing
-        _cleanup_upload(body.imageId)
         return payload
     except Exception as exc:
         traceback.print_exc()
